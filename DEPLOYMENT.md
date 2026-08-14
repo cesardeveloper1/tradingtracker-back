@@ -1,5 +1,17 @@
 # 🚀 Yape Tracker Backend — Railway Deployment Guide
 
+> Para habilitar la canalizacion de pagos Agiliza360 en una base existente,
+> configura las variables nuevas de `.env.example` y ejecuta `flask db upgrade`
+> una vez antes de levantar el proceso web. El entorno `production` desactiva
+> automaticamente la creacion de esquema y mantiene cerrado el ingest legacy.
+
+La app Android canjea tickets firmados por `ssgg` en
+`POST /api/device-pairings/exchange`; luego publica en
+`POST /api/payment-events/v1`. El tracker entrega a
+`/api/v3/internal/payment-events/v1` mediante outbox, con los headers
+`X-Delivery-Id`, `X-Timestamp` y `X-Signature: sha256=<HMAC>`.
+La firma se calcula sobre `timestamp + "." + cuerpo JSON exacto`.
+
 ## Phase 4: Backend with PostgreSQL + Public API
 
 This backend provides:
@@ -37,8 +49,9 @@ This backend provides:
    - Set the **Root Directory** to `backend/`
 5. Configure environment variables:
    - Railway will auto-populate `DATABASE_URL` from PostgreSQL
-   - Add `MASTER_API_KEY` = `your-secure-random-key-here` (generate with `openssl rand -hex 32`)
-   - Add `FLASK_ENV` = `production`
+   - Add `ENVIRONMENT` = `production`
+   - Add `SSGG_BASE_URL` = dominio publico del backend central
+   - Add `PAYMENT_TRACKER_SHARED_SECRET` = secreto aleatorio de 32+ caracteres, igual en SSGG
 
 ### Option B: Via Railway CLI
 
@@ -57,8 +70,9 @@ railway init
 railway add
 
 # Set environment variables
-railway variables set MASTER_API_KEY="your-secure-key"
-railway variables set FLASK_ENV="production"
+railway variables set ENVIRONMENT="production"
+railway variables set SSGG_BASE_URL="https://api.example.com"
+railway variables set PAYMENT_TRACKER_SHARED_SECRET="your-secure-random-secret"
 
 # DATABASE_URL is automatically set by Railway PostgreSQL plugin
 ```
@@ -270,10 +284,10 @@ Then run: `flask db upgrade`
 
 ## Security Best Practices
 
-1. **Never commit MASTER_API_KEY** to Git (use Railway variables)
-2. **Generate strong keys**: `openssl rand -hex 32`
-3. **Rotate keys regularly**: Create new ones, revoke old ones
-4. **Use different keys per service**: One for commerce, one for dashboards, etc.
+1. **Never commit PAYMENT_TRACKER_SHARED_SECRET** to Git
+2. **Generate a strong master secret**: `openssl rand -hex 32`
+3. Pairing, webhook and admin derive different keys automatically
+4. Rotate the master secret through a coordinated backend deployment
 5. **Monitor usage**: Check connection logs in `/api/conexiones`
 
 ---
@@ -289,8 +303,9 @@ pip install -r requirements.txt
 # Create .env file
 cat > .env << EOF
 DATABASE_URL=  # Leave empty for SQLite
-MASTER_API_KEY=dev-key
-FLASK_ENV=development
+ENVIRONMENT=development
+SSGG_BASE_URL=http://localhost:3000
+PAYMENT_TRACKER_SHARED_SECRET=local-shared-development-secret
 EOF
 
 # Run locally

@@ -13,11 +13,21 @@ import secrets
 import logging
 from functools import wraps
 from datetime import datetime, date, timedelta
+from dotenv import load_dotenv
+
+load_dotenv()
 
 from flask import Flask, jsonify, request, g
 from flask_sqlalchemy import SQLAlchemy
 from flask_cors import CORS
+from flask_migrate import Migrate
 from sqlalchemy import func, extract, text
+from agiliza_config import (
+    CAPACITOR_CORS_ORIGINS,
+    derived_secret,
+    environment,
+    is_production,
+)
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -51,15 +61,16 @@ app.config['SQLALCHEMY_ENGINE_OPTIONS'] = {
 }
 
 # --- CORS --------------------------------------------------------------
-CORS(app, resources={r"/api/*": {"origins": "*"}})
+CORS(app, resources={r"/api/*": {"origins": CAPACITOR_CORS_ORIGINS}})
 
 # --- Master key --------------------------------------------------------
-MASTER_API_KEY = os.environ.get('MASTER_API_KEY', 'dev-master-key-cambiar-en-prod')
+MASTER_API_KEY = derived_secret('legacy-api-admin').hex()
 
 # --- Uptime tracker ----------------------------------------------------
 APP_START_TIME = time.time()
 
 db = SQLAlchemy(app)
+migrate = Migrate(app, db)
 
 # ========================================================================
 # MODELOS
@@ -200,6 +211,12 @@ class Contacto(db.Model):
         }
 
 
+# La canalizacion financiera vive separada del modelo analitico legacy.
+from payment_pipeline import init_payment_pipeline
+
+payment_pipeline = init_payment_pipeline(app, db)
+
+
 # ========================================================================
 # Crear tablas
 # ========================================================================
@@ -217,9 +234,15 @@ def _ensure_schema():
 
 
 with app.app_context():
-    db.create_all()
-    _ensure_schema()
-    logger.info("Base de datos inicializada correctamente")
+    auto_create = not is_production()
+    if auto_create:
+        db.create_all()
+        _ensure_schema()
+        logger.info("Base de datos local inicializada correctamente")
+    else:
+        logger.info("AUTO_CREATE_SCHEMA desactivado; se esperan migraciones aplicadas")
+
+payment_pipeline.start_worker()
 
 # ========================================================================
 # Rate limiting (in-memory, simple)
@@ -448,6 +471,26 @@ def require_api_key(f):
     return decorated
 
 
+def _api_key_has_permission(api_key, permission: str) -> bool:
+    permissions = {item.strip() for item in (api_key.permisos or '').split(',') if item.strip()}
+    return 'admin' in permissions or permission in permissions
+
+
+def _authenticate_api_key(permission: str):
+    raw_key = request.headers.get('X-API-Key', '')
+    if not raw_key:
+        return None, _json_error('Se requiere header X-API-Key', 401)
+    key_hash = _hash_key(raw_key)
+    api_key = ApiKey.query.filter_by(key_hash=key_hash, activa=True).first()
+    if not api_key:
+        return None, _json_error('API key invalida o desactivada', 401)
+    if not _api_key_has_permission(api_key, permission):
+        return None, _json_error(f'La API key no posee el permiso {permission}', 403)
+    if not _check_rate_limit(key_hash, api_key.rate_limit):
+        return None, _json_error('Limite de velocidad excedido', 429)
+    return api_key, None
+
+
 # ========================================================================
 # BEFORE REQUEST — log de conexiones
 # ========================================================================
@@ -574,6 +617,9 @@ def handle_notificaciones():
         description: Notificación creada (POST)
     """
     if request.method == 'POST':
+        _, auth_error = _authenticate_api_key('ingest')
+        if auth_error:
+            return auth_error
         data = request.json
         if not data or 'app_name' not in data:
             return _json_error('Se requiere app_name', 400)
@@ -1602,5 +1648,5 @@ def health_check():
 
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5000))
-    debug = os.environ.get('FLASK_ENV', 'development') == 'development'
+    debug = environment() == 'development'
     app.run(debug=debug, host='0.0.0.0', port=port)
